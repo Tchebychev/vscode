@@ -9,19 +9,23 @@ import { ChatOriginKind } from '../common/state/protocol/state.js';
 import { isSubagentChatUri, SessionStatus, withMigratedSessionGitHubState, withSessionExternal, withSessionStatusFlag } from '../common/state/sessionState.js';
 import { AGENT_HOST_CATALOG_PAYLOAD_VERSION, decodeAgentHostCatalogPayload, reviveAgentHostCatalogData, type AgentHostCatalogRevivedData } from './agentHostCatalogProjection.js';
 import { fromCatalogChatOrigin } from './agentHostCatalogSourceResolver.js';
-import type { IAgentHostDatabase } from './agentHostDatabase.js';
+import type { IAgentHostDatabase, IAgentHostDatabaseSessionV2 } from './agentHostDatabase.js';
 import type { IRegisteredSession } from './agentSessionRegistry.js';
 
-export type AgentHostCatalogListResult =
-	/** The central row is authoritative for this session's listing. */
-	| { readonly eligible: true; readonly metadata: IAgentSessionMetadata; readonly data: AgentHostCatalogRevivedData }
-	/**
-	 * The central row marks the session as a chat backing. It is deliberately
-	 * hidden and must never fall back into the top-level list.
-	 */
-	| { readonly eligible: false; readonly chatBacking: true }
-	/** The central row is missing, stale, unusable, or unreadable; the caller falls back and repairs only non-read failures. */
-	| { readonly eligible: false; readonly chatBacking: false; readonly detail: string; readonly error?: Error };
+export type AgentHostCatalogListResult = {
+	/** The central row, null when absent, or undefined when it was not read successfully. */
+	readonly catalog?: IAgentHostDatabaseSessionV2 | null;
+} & (
+		/** The central row is authoritative for this session's listing. */
+		| { readonly eligible: true; readonly metadata: IAgentSessionMetadata; readonly data: AgentHostCatalogRevivedData }
+		/**
+		 * The central row marks the session as a chat backing. It is deliberately
+		 * hidden and must never fall back into the top-level list.
+		 */
+		| { readonly eligible: false; readonly chatBacking: true }
+		/** The central row is missing, stale, unusable, or unreadable; the caller falls back and repairs only non-read failures. */
+		| { readonly eligible: false; readonly chatBacking: false; readonly detail: string; readonly error?: Error }
+	);
 
 export type AgentHostCatalogListManyResult = {
 	readonly results: readonly AgentHostCatalogListResult[];
@@ -79,36 +83,36 @@ export class AgentHostCatalogListReader {
 	private _read(registered: IRegisteredSession, catalog: Awaited<ReturnType<IAgentHostDatabase['getSessionV2']>>): AgentHostCatalogListResult {
 		const session = registered.session.toString();
 		if (!catalog) {
-			return ineligible('no central row');
+			return ineligible('no central row', null);
 		}
 		if (catalog.session !== session) {
-			return ineligible(`central row identity ${catalog.session} does not match`);
+			return ineligible(`central row identity ${catalog.session} does not match`, catalog);
 		}
 		if (catalog.isChatBacking) {
-			return { eligible: false, chatBacking: true };
+			return { eligible: false, chatBacking: true, catalog };
 		}
 		if (AgentSession.provider(registered.session) !== registered.provider || catalog.provider !== registered.provider) {
-			return ineligible(`central row provider ${catalog.provider} does not match ${registered.provider}`);
+			return ineligible(`central row provider ${catalog.provider} does not match ${registered.provider}`, catalog);
 		}
 		if (catalog.payloadVersion !== AGENT_HOST_CATALOG_PAYLOAD_VERSION) {
-			return ineligible(`central row payload version ${catalog.payloadVersion} is outdated`);
+			return ineligible(`central row payload version ${catalog.payloadVersion} is outdated`, catalog);
 		}
 		const decoded = decodeAgentHostCatalogPayload(catalog.payload);
 		if (!decoded.ok) {
-			return ineligible(`central payload is ${decoded.reason}: ${decoded.error}`);
+			return ineligible(`central payload is ${decoded.reason}: ${decoded.error}`, catalog);
 		}
 		// A payload can only become chat-backing through a write that also
 		// updates the row marker, but an inconsistent row must still hide
 		// the session rather than surface a backing as a top-level entry.
 		if (decoded.value.data.isChatBacking) {
-			return { eligible: false, chatBacking: true };
+			return { eligible: false, chatBacking: true, catalog };
 		}
 		const revivedData = reviveAgentHostCatalogData(decoded.value.data);
 		const data = {
 			...revivedData,
 			chats: revivedData.chats.filter(chat => !isSubagentChatUri(chat.uri) && fromCatalogChatOrigin(chat.origin)?.kind !== ChatOriginKind.Tool),
 		};
-		return { eligible: true, metadata: this._toSessionMetadata(registered, data), data };
+		return { eligible: true, metadata: this._toSessionMetadata(registered, data), data, catalog };
 	}
 
 	private _toSessionMetadata(registered: IRegisteredSession, data: AgentHostCatalogRevivedData): IAgentSessionMetadata {
@@ -141,8 +145,8 @@ export class AgentHostCatalogListReader {
 	}
 }
 
-function ineligible(detail: string): AgentHostCatalogListResult {
-	return { eligible: false, chatBacking: false, detail };
+function ineligible(detail: string, catalog: IAgentHostDatabaseSessionV2 | null): AgentHostCatalogListResult {
+	return { eligible: false, chatBacking: false, detail, catalog };
 }
 
 function readFailed(error: unknown): AgentHostCatalogListResult {
