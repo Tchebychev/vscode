@@ -12,6 +12,7 @@ import { AH_META_DEV_CONTAINER_WORKTREE_DB_KEY, isAgentDevContainerWorktreeHandl
 import { readRemoteSessionOrigin, REMOTE_SESSION_ORIGIN_METADATA_KEY } from '../common/meta/agentRemoteSessionMeta.js';
 import { SESSION_META_ARTIFACTS_KEY } from '../common/sessionArtifacts.js';
 import { ChatInteractivity } from '../common/state/protocol/channels-chat/state.js';
+import { SessionOriginKind, type SessionOrigin } from '../common/state/protocol/channels-session/state.js';
 import { SESSION_META_CREATED_BY_SESSION_KEY, SESSION_META_EHCLI_ADOPTABLE_KEY, SESSION_META_EHCLI_ADOPTED_KEY, SESSION_META_FOLDER_PICKER_KEY, SESSION_META_GIT_DATA_KEY, SESSION_META_GIT_KEY, SESSION_META_GITHUB_DATA_KEY, SESSION_META_GITHUB_KEY, SESSION_META_MULTI_ROOT_KEY, SESSION_META_SOURCE_CONTROL_KEY, SESSION_META_WORKSPACELESS_KEY } from '../common/state/sessionState.js';
 
 export const AGENT_HOST_CATALOG_PAYLOAD_VERSION = 1;
@@ -394,8 +395,15 @@ const chatsValidator = new RefinedValidator(
 	},
 );
 
+export const agentHostCatalogSessionOriginValidator: IValidator<SessionOrigin> = plainObject(vObj({
+	kind: vEnum(SessionOriginKind.Automation),
+	automation: uriString(),
+	run: uriString(),
+}));
+
 export const agentHostCatalogDataValidator = plainObject(vObj({
 	modifiedTime: safeInteger(),
+	origin: vOptionalProp(agentHostCatalogSessionOriginValidator),
 	summary: vOptionalProp(boundedString(AGENT_HOST_CATALOG_TITLE_LENGTH_LIMIT)),
 	titleSource: vOptionalProp(vEnum('user', 'agent', 'auto')),
 	isRead: vBoolean(),

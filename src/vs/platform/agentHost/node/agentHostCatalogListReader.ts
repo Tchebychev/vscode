@@ -123,6 +123,7 @@ export class AgentHostCatalogListReader {
 			// payload's own timestamp until the next reconciliation writes it back.
 			modifiedTime: Math.max(data.modifiedTime, registered.modifiedTime),
 			summary: data.summary,
+			origin: data.origin,
 			status,
 			project: data.project,
 			workingDirectories: [...data.workingDirectories],
