@@ -2027,12 +2027,9 @@ export class AgentService extends Disposable implements IAgentService {
 		}
 	}
 
-	private async _legacyRegisteredSessionMetadata(registered: IRegisteredSession, catalog?: IAgentHostDatabaseSessionV2 | null): Promise<ILegacyRegisteredSessionMetadata | undefined> {
+	private async _legacyRegisteredSessionMetadata(registered: IRegisteredSession, catalog?: IAgentHostDatabaseSessionV2 | null, fallbackMetadata?: IAgentSessionMetadata): Promise<ILegacyRegisteredSessionMetadata | undefined> {
 		const agent = this._providerService.getProvider(registered.provider);
-		if (!agent) {
-			return undefined;
-		}
-		const metadata = await this._registeredSessionMetadata(agent, registered.session, registered.external, registered);
+		const metadata = fallbackMetadata ?? (agent ? await this._registeredSessionMetadata(agent, registered.session, registered.external, registered) : undefined);
 		if (!metadata) {
 			return undefined;
 		}
@@ -2041,7 +2038,7 @@ export class AgentService extends Disposable implements IAgentService {
 			const ref = await this._sessionDataService.tryOpenDatabase(metadata.session);
 			if (!ref) {
 				const origin = await this._resolveSessionOrigin(metadata.session, undefined, catalog);
-				return { metadata: { ...sanitized, ...(origin ? { origin } : {}) }, persistedTitle: await this._readPersistedSessionTitle(metadata.session) };
+				return { metadata: { ...(fallbackMetadata ?? sanitized), ...(origin ? { origin } : {}) }, persistedTitle: await this._readPersistedSessionTitle(metadata.session) };
 			}
 			try {
 				const session = metadata.session.toString();
@@ -3610,7 +3607,7 @@ export class AgentService extends Disposable implements IAgentService {
 			&& !providersWithEligibleCatalogs.has(provider));
 		const fallbackProviders = new Map<AgentProvider, { agent: IAgent; sessionCount: number }>();
 		for (const result of catalogResults) {
-			if (!result || result.central.eligible || result.central.chatBacking) {
+			if (!result || result.central.eligible || result.central.chatBacking || result.central.fallbackMetadata) {
 				continue;
 			}
 			const fallback = fallbackProviders.get(result.registeredSession.provider);
@@ -3684,7 +3681,7 @@ export class AgentService extends Disposable implements IAgentService {
 				}
 
 				try {
-					const fallback = await this._legacyRegisteredSessionMetadata(registeredSession, central.catalog);
+					const fallback = await this._legacyRegisteredSessionMetadata(registeredSession, central.catalog, central.fallbackMetadata);
 					if (!fallback) {
 						return undefined;
 					}
