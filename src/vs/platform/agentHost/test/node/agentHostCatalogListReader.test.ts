@@ -137,6 +137,31 @@ suite('AgentHostCatalogListReader', () => {
 		assert.deepStrictEqual(result.metadata.origin, origin);
 	});
 
+	for (const mismatch of ['session', 'provider', 'registration'] as const) {
+		test(`does not forward a catalogue with a mismatched ${mismatch} to origin recovery`, async () => {
+			const origin: SessionOrigin = { kind: SessionOriginKind.Automation, automation: 'ahp-automation:/other', run: 'ahp-automation-run:/other' };
+			const database = createDatabase({ ...data, origin });
+			const catalog = database.catalog;
+			assert.ok(catalog);
+			database.getSessionV2 = async () => ({
+				...catalog,
+				...(mismatch === 'session' ? { session: AgentSession.uri('copilot', 'other').toString() } : {}),
+				...(mismatch === 'provider' ? { provider: 'claude' } : {}),
+			});
+			const result = await new AgentHostCatalogListReader(database).read(
+				mismatch === 'registration' ? { ...registered, provider: 'claude' } : registered,
+			);
+
+			assert.deepStrictEqual({
+				eligible: result.eligible,
+				catalog: result.catalog,
+			}, {
+				eligible: false,
+				catalog: null,
+			});
+		});
+	}
+
 	test('converts a verified catalog payload into complete list metadata and chats', async () => {
 		const result = await new AgentHostCatalogListReader(createDatabase()).read(registered);
 		assert.strictEqual(result.eligible, true);

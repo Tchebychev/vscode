@@ -65,7 +65,7 @@ import type { IAgentHostStorageService } from '../../node/agentHostStorageServic
 import { AGENT_HOST_CATALOG_VERIFICATION_VERSION_STORAGE_KEY, CATALOG_VERIFICATION_VERSION } from '../../node/agentHostCatalogReconciliationService.js';
 import { AgentSessionRegistry, type IRegisteredSession } from '../../node/agentSessionRegistry.js';
 import { AgentHostManagementService } from '../../node/agentHostManagementService.js';
-import { AGENT_HOST_TITLE_SOURCE_AGENT, AGENT_HOST_TITLE_SOURCE_AUTO, customChatTitleMetadataKey, customChatTitleSourceMetadataKey, SESSION_ARTIFACTS_KEY, SESSION_CUSTOM_TITLE_KEY, SESSION_CUSTOM_TITLE_SOURCE_KEY, SESSION_ORIGIN_KEY } from '../../node/shared/persistSessionMetadata.js';
+import { AGENT_HOST_TITLE_SOURCE_AGENT, customChatTitleMetadataKey, customChatTitleSourceMetadataKey, SESSION_ARTIFACTS_KEY, SESSION_CUSTOM_TITLE_KEY, SESSION_CUSTOM_TITLE_SOURCE_KEY, SESSION_ORIGIN_KEY } from '../../node/shared/persistSessionMetadata.js';
 import { MockAgent, ScriptedMockAgent } from './mockAgent.js';
 import { readChatInputState } from '../../common/meta/agentHostChatInputState.js';
 import { mapSessionEventsToHistoryRecords } from './historyRecordFixtures.js';
@@ -5221,11 +5221,10 @@ suite('AgentService (node dispatcher)', () => {
 			await created;
 		}
 
-		async function createLegacyAutomationSession(sessionData = createPerSessionDataService()) {
+		async function createLegacyAutomationSession(sessionData = createPerSessionDataService(), database = new TestAgentHostOrchestratorDatabase()) {
 			const directory = mkdtempSync(join(tmpdir(), 'agent-session-origin-'));
 			disposables.add(toDisposable(() => rmSync(directory, { recursive: true, force: true })));
 			const storage = URI.file(join(directory, 'storage.json'));
-			const database = new TestAgentHostOrchestratorDatabase();
 			const host = createHost(sessionData.service, database);
 			const session = await host.createSession({ provider: 'copilot' });
 			await host.listSessions();
@@ -5296,6 +5295,56 @@ suite('AgentService (node dispatcher)', () => {
 				listed: origin,
 				restored: origin,
 				runHistory: [],
+			});
+		});
+
+		test('reserves the Automation session identity durably before session publication', async () => {
+			const directory = mkdtempSync(join(tmpdir(), 'automation-session-intent-'));
+			disposables.add(toDisposable(() => rmSync(directory, { recursive: true, force: true })));
+			const storage = URI.file(join(directory, 'storage.json'));
+			const host = createHost(createPerSessionDataService().service, new TestAgentHostOrchestratorDatabase(), storage);
+			await createAutomation(host);
+			const reservations: { resource: string; intents: readonly { run: string; session: string }[] | undefined }[] = [];
+			disposables.add(getStateManager(host).onDidEmitNotification(notification => {
+				if (notification.type === NotificationType.SessionAdded) {
+					const stored = JSON.parse(readFileSync(storage.fsPath, 'utf8')) as { automations: { sessionCreations?: { run: string; session: string }[] } };
+					reservations.push({ resource: notification.summary.resource, intents: stored.automations.sessionCreations });
+				}
+			}));
+			const sent = Event.toPromise(copilotAgent.onDidSendMessage, disposables);
+			const run = await host.runAutomation({ channel: 'ahp-automations://', automation, requestId: 'session-intent' });
+			const { session } = await sent;
+			const stored = JSON.parse(readFileSync(storage.fsPath, 'utf8')) as { automations: { sessionCreations?: { run: string; session: string }[] } };
+			assert.deepStrictEqual({
+				reservations,
+				intentsAfterSend: stored.automations.sessionCreations,
+				linked: getStateManager(host).getAutomationRunState(run.resource)?.primarySession,
+			}, {
+				reservations: [{ resource: session.toString(), intents: [{ run: run.resource, session: session.toString() }] }],
+				intentsAfterSend: undefined,
+				linked: session.toString(),
+			});
+		});
+
+		test('keeps or deletes historical run sessions without changing ordinary sessions', async () => {
+			const { sessionData, database, storage, session, origin } = await createLegacyAutomationSession();
+			const host = createHost(sessionData.service, database, storage);
+			const ordinary = await host.createSession({ provider: 'copilot' });
+			await host.deleteAutomation(automation, false);
+			const kept = await host.listSessions();
+			await host.deleteAutomation(automation, true);
+			await host.disposeSession(session);
+			const remaining = await host.listSessions();
+			assert.deepStrictEqual({
+				keptOrigin: kept.find(metadata => metadata.session.toString() === session.toString())?.origin,
+				remaining: remaining.map(metadata => ({ session: metadata.session.toString(), origin: metadata.origin })),
+				history: getStateManager(host).getAutomationCatalogState()?.entries,
+				tombstoned: await database.isSessionTombstoned(session.toString()),
+			}, {
+				keptOrigin: origin,
+				remaining: [{ session: ordinary.toString(), origin: undefined }],
+				history: [],
+				tombstoned: true,
 			});
 		});
 
@@ -5447,6 +5496,42 @@ suite('AgentService (node dispatcher)', () => {
 				catalog: origin,
 				dirty: 0,
 			});
+
+			for (const mismatch of ['session', 'provider'] as const) {
+				test(`rejects a mismatched ${mismatch} when rereading the catalogue during origin migration`, async () => {
+					let corruptReads = false;
+					const foreignOrigin: SessionOrigin = { kind: SessionOriginKind.Automation, automation: 'ahp-automation:/other', run: 'ahp-automation-run:/other' };
+					class MismatchedCatalogDatabase extends TestAgentHostOrchestratorDatabase {
+						override async getSessionV2(session: string): Promise<IAgentHostDatabaseSessionV2 | undefined> {
+							const catalog = await super.getSessionV2(session);
+							if (!corruptReads || catalog === undefined) {
+								return catalog;
+							}
+							const data = catalogDataOf(catalog);
+							assert.ok(data);
+							const encoded = encodeAgentHostCatalogPayload({ ...data, origin: foreignOrigin });
+							assert.ok(encoded.ok);
+							return {
+								...catalog,
+								...encoded.value,
+								...(mismatch === 'session' ? { session: AgentSession.uri('copilot', 'other').toString() } : { provider: 'claude' }),
+							};
+						}
+					}
+					const { sessionData, database, storage, session, origin } = await createLegacyAutomationSession(createPerSessionDataService(), new MismatchedCatalogDatabase());
+					const host = createHost(sessionData.service, database, storage);
+					corruptReads = true;
+					const listing = await host.listSessions();
+
+					assert.deepStrictEqual({
+						listed: listing.find(metadata => metadata.session.toString() === session.toString())?.origin,
+						persisted: await sessionData.database(session).getMetadata(SESSION_ORIGIN_KEY),
+					}, {
+						listed: origin,
+						persisted: JSON.stringify(origin),
+					});
+				});
+			}
 		});
 
 		for (const operation of ['catalogue listing', 'legacy listing', 'restoration'] as const) {

@@ -831,7 +831,15 @@ export class AgentService extends Disposable implements IAgentService {
 				const provider = this._providerService.resolveProvider(template.provider);
 				return provider !== undefined && provider.isReadyForAutomation?.(template.model, reader) !== false;
 			},
-			createSession: (template, run) => this._createSession({
+			createSessionResource: template => {
+				const provider = this._providerService.resolveProvider(template.provider);
+				if (provider === undefined) {
+					throw new Error(`Automation provider is unavailable: ${template.provider}`);
+				}
+				return this._mintSessionUri(provider);
+			},
+			createSession: (template, run, session) => this._createSession({
+				session,
 				provider: template.provider,
 				model: template.model,
 				agent: template.agent,
@@ -842,6 +850,27 @@ export class AgentService extends Disposable implements IAgentService {
 				automation: run.automation,
 				run: run.resource,
 			}),
+			hasSession: async (session, run) => {
+				if (await this._sessionRegistry.get(session) === undefined || (await this._sessionRegistry.listProvisional()).has(session.toString())) {
+					return false;
+				}
+				const database = await this._sessionDataService.tryOpenDatabase(session);
+				if (database === undefined) {
+					return false;
+				}
+				try {
+					const origin = readPersistedSessionOrigin(await database.object.getMetadata(SESSION_ORIGIN_KEY));
+					return origin?.kind === SessionOriginKind.Automation && origin.automation === run.automation && origin.run === run.resource;
+				} finally {
+					database.dispose();
+				}
+			},
+			deleteSession: async session => {
+				if (this._providerService.getProviderForSession(session) === undefined) {
+					throw new Error(`Automation session provider is unavailable: ${session}`);
+				}
+				await this.disposeSession(session);
+			},
 			startSession: (session, message) => this._startAutomationMessage(session, message),
 			cancelSession: session => this._cancelAutomationSession(session),
 		}));
@@ -1978,6 +2007,22 @@ export class AgentService extends Disposable implements IAgentService {
 			: sessions.filter(metadata => !unmaterialized.has(metadata.session.toString()));
 	}
 
+	private _readSessionOriginCatalog(session: URI, catalog: IAgentHostDatabaseSessionV2 | null | undefined): AgentHostCatalogData | undefined {
+		if (catalog === undefined || catalog === null) {
+			return undefined;
+		}
+		if (catalog.session !== session.toString() || catalog.provider !== AgentSession.provider(session)) {
+			this._logService.warn(`[AgentService] Ignoring session origin from a mismatched catalog envelope for ${session}`);
+			return undefined;
+		}
+		const decoded = decodeAgentHostCatalogPayload(catalog.payload, { forMigration: true });
+		if (!decoded.ok) {
+			this._logService.warn(`[AgentService] Failed to read session origin from catalog for ${session}: ${decoded.error}`);
+			return undefined;
+		}
+		return decoded.value.data;
+	}
+
 	private async _resolveSessionOrigin(session: URI, persisted: string | undefined, catalog?: IAgentHostDatabaseSessionV2 | null): Promise<SessionOrigin | undefined> {
 		let recovered: SessionOrigin | undefined;
 		try {
@@ -1986,13 +2031,9 @@ export class AgentService extends Disposable implements IAgentService {
 			if (catalog === undefined) {
 				catalog = await this._orchestratorDatabase.getSessionV2(session.toString());
 			}
-			const decoded = catalog && decodeAgentHostCatalogPayload(catalog.payload, { forMigration: true });
-			if (decoded && !decoded.ok) {
-				this._logService.warn(`[AgentService] Failed to read session origin from catalog for ${session}: ${decoded.error}`);
-			}
-			recovered ??= (decoded?.ok ? decoded.value.data.origin : undefined)
-				?? this._automationService.getLegacySessionOrigin(session.toString());
-			if (!recovered || (origin && (!decoded?.ok || equals(decoded.value.data.origin, origin)))) {
+			const data = this._readSessionOriginCatalog(session, catalog);
+			recovered ??= data?.origin ?? this._automationService.getLegacySessionOrigin(session.toString());
+			if (!recovered || (origin && (data === undefined || equals(data.origin, origin)))) {
 				return recovered;
 			}
 			// Share the catalogue's deletion fence without recreating missing session databases.
@@ -2002,17 +2043,17 @@ export class AgentService extends Disposable implements IAgentService {
 				}
 				const persistedOrigin = readPersistedSessionOrigin(await database?.object.getMetadata(SESSION_ORIGIN_KEY));
 				const currentCatalog = await this._orchestratorDatabase.getSessionV2(session.toString());
-				const current = currentCatalog && decodeAgentHostCatalogPayload(currentCatalog.payload, { forMigration: true });
-				const origin = persistedOrigin ?? (current?.ok ? current.value.data.origin : undefined) ?? recovered;
+				const current = this._readSessionOriginCatalog(session, currentCatalog);
+				const origin = persistedOrigin ?? current?.origin ?? recovered;
 				const legacyMetadata = { [SESSION_ORIGIN_KEY]: JSON.stringify(origin) };
-				if (!current?.ok) {
+				if (current === undefined) {
 					if (database) {
 						await database.object.setMetadataValues(legacyMetadata);
 						return origin;
 					}
 					throw new Error(`Cannot persist session origin without session metadata for ${session}`);
 				}
-				const result = await synchronize({ data: { ...current.value.data, origin }, legacyMetadata });
+				const result = await synchronize({ data: { ...current, origin }, legacyMetadata });
 				if (result.status !== 'acknowledged') {
 					throw new Error(`Failed to persist session origin for ${session}: ${result.reason}`);
 				}
@@ -5953,6 +5994,10 @@ export class AgentService extends Disposable implements IAgentService {
 
 	async runAutomation(params: RunAutomationParams): Promise<RunAutomationResult> {
 		return this._automationService.runAutomation(params);
+	}
+
+	deleteAutomation(resource: string, deleteHistory: boolean, legacySessions?: readonly URI[]): Promise<void> {
+		return this._automationService.deleteAutomation(resource, deleteHistory, legacySessions);
 	}
 
 	async fetchAutomationRuns(params: FetchAutomationRunsParams): Promise<FetchAutomationRunsResult> {

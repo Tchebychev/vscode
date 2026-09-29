@@ -13,7 +13,7 @@ import type { IAgentHostDatabase, IAgentHostDatabaseSessionV2 } from './agentHos
 import type { IRegisteredSession } from './agentSessionRegistry.js';
 
 export type AgentHostCatalogListResult = {
-	/** The central row, null when absent, or undefined when it was not read successfully. */
+	/** The central row, null when absent or rejected, or undefined when it was not read successfully. */
 	readonly catalog?: IAgentHostDatabaseSessionV2 | null;
 } & (
 		/** The central row is authoritative for this session's listing. */
@@ -86,13 +86,13 @@ export class AgentHostCatalogListReader {
 			return ineligible('no central row', null);
 		}
 		if (catalog.session !== session) {
-			return ineligible(`central row identity ${catalog.session} does not match`, catalog);
+			return ineligible(`central row identity ${catalog.session} does not match`, null);
 		}
 		if (catalog.isChatBacking) {
 			return { eligible: false, chatBacking: true, catalog };
 		}
 		if (AgentSession.provider(registered.session) !== registered.provider || catalog.provider !== registered.provider) {
-			return ineligible(`central row provider ${catalog.provider} does not match ${registered.provider}`, catalog);
+			return ineligible(`central row provider ${catalog.provider} does not match ${registered.provider}`, null);
 		}
 		const needsMigration = catalog.payloadVersion !== AGENT_HOST_CATALOG_PAYLOAD_VERSION;
 		if (needsMigration && catalog.payloadVersion !== 1) {
